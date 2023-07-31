@@ -20,8 +20,8 @@ from nerfstudio.engine.schedulers import (
     MultiStepSchedulerConfig,
 )
 
-from permuto2nerfstudio.permuto_sdf import PermutoSDFModelConfig
-from permuto2nerfstudio.permuto_field import PermutoFieldConfig
+from permuto.permuto_sdf import PermutoSDFModelConfig
+from permuto.permuto_field import PermutoFieldConfig
 
 
 permuto_sdf_method = MethodSpecification(

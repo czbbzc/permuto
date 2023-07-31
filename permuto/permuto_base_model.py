@@ -21,6 +21,7 @@ from __future__ import annotations
 from abc import abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Tuple, Type, cast
+from collections import defaultdict
 
 import torch
 import torch.nn.functional as F
@@ -62,7 +63,7 @@ from nerfstudio.engine.callbacks import (
     TrainingCallbackLocation,
 )
 
-from permuto2nerfstudio.permuto_field import PermutoFieldConfig
+from permuto.permuto_field import PermutoFieldConfig
 
 
 @dataclass
@@ -135,6 +136,17 @@ class PermutoBaseModel(Model):
             num_images=self.num_train_data,
             use_average_appearance_embedding=self.config.use_average_appearance_embedding,
         )
+        
+        # sampler
+        self.sampler = NeuSSampler(
+            num_samples=self.config.num_samples,
+            num_samples_importance=self.config.num_samples_importance,
+            num_samples_outside=self.config.num_samples_outside,
+            num_upsample_steps=self.config.num_up_sample_steps,
+            base_variance=self.config.base_variance,
+        )
+
+        self.anneal_end = 50000
 
         # Collider
         self.collider = AABBBoxCollider(self.scene_box, near_plane=0.05)
@@ -193,16 +205,6 @@ class PermutoBaseModel(Model):
         self.ssim = structural_similarity_index_measure
         self.lpips = LearnedPerceptualImagePatchSimilarity()
         
-        # sampler
-        self.sampler = NeuSSampler(
-            num_samples=self.config.num_samples,
-            num_samples_importance=self.config.num_samples_importance,
-            num_samples_outside=self.config.num_samples_outside,
-            num_upsample_steps=self.config.num_up_sample_steps,
-            base_variance=self.config.base_variance,
-        )
-
-        self.anneal_end = 50000
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = {}
