@@ -23,40 +23,48 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Tuple, Type, cast
 from collections import defaultdict
 
+
 import torch
 import torch.nn.functional as F
 from torch.nn import Parameter
+from torchmetrics import PeakSignalNoiseRatio
 from torchmetrics.functional import structural_similarity_index_measure
-from torchmetrics.image import PeakSignalNoiseRatio
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
-
-from nerfstudio.cameras.rays import RayBundle
+from torchtyping import TensorType
+from typing_extensions import Literal
+from nerfstudio.cameras.rays import RayBundle, RaySamples
 from nerfstudio.field_components.encodings import NeRFEncoding
 from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.field_components.spatial_distortions import SceneContraction
-from nerfstudio.fields.nerfacto_field import NerfactoField
+from nerfstudio.fields.nerfacto_field import TCNNNerfactoField
 from nerfstudio.fields.sdf_field import SDFFieldConfig
 from nerfstudio.fields.vanilla_nerf_field import NeRFField
 from nerfstudio.model_components.losses import (
     L1Loss,
     MSELoss,
+    MultiViewLoss,
     ScaleAndShiftInvariantLoss,
+    SensorDepthLoss,
+    compute_scale_and_shift,
     monosdf_normal_loss,
 )
-from nerfstudio.model_components.ray_samplers import LinearDisparitySampler
+from nerfstudio.model_components.patch_warping import PatchWarping
+from nerfstudio.model_components.ray_samplers import LinearDisparitySampler, NeuSSampler
 from nerfstudio.model_components.renderers import (
     AccumulationRenderer,
     DepthRenderer,
     RGBRenderer,
     SemanticRenderer,
 )
-from nerfstudio.model_components.scene_colliders import AABBBoxCollider, NearFarCollider, SphereCollider
+from nerfstudio.model_components.scene_colliders import (
+    AABBBoxCollider,
+    NearFarCollider,
+    SphereCollider,
+)
 from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils import colormaps
 from nerfstudio.utils.colors import get_color
-from nerfstudio.utils.math import normalized_depth_scale_and_shift
 
-from nerfstudio.model_components.ray_samplers import NeuSSampler
 from nerfstudio.engine.callbacks import (
     TrainingCallback,
     TrainingCallbackAttributes,
@@ -68,7 +76,7 @@ from permuto.permuto_field import PermutoFieldConfig
 
 @dataclass
 class PermutoBaseModelConfig(ModelConfig):
-    """Surface Model Config"""
+    """Nerfacto Model Config"""
 
     _target: Type = field(default_factory=lambda: PermutoBaseModel)
     near_plane: float = 0.05
@@ -82,7 +90,7 @@ class PermutoBaseModelConfig(ModelConfig):
     use_average_appearance_embedding: bool = False
     """Whether to use average appearance embedding or zeros for inference."""
     eikonal_loss_mult: float = 0.1
-    """Monocular normal consistency loss multiplier."""
+    """Eikonal loss multiplier."""
     fg_mask_loss_mult: float = 0.01
     """Foreground mask loss multiplier."""
     mono_normal_loss_mult: float = 0.0
@@ -95,29 +103,20 @@ class PermutoBaseModelConfig(ModelConfig):
     background_model: Literal["grid", "mlp", "none"] = "mlp"
     """background models"""
     num_samples_outside: int = 32
-    """Number of samples outside the bounding sphere for background"""
+    """Number of samples outside the bounding sphere for backgound"""
     periodic_tvl_mult: float = 0.0
-    """Total variational loss multiplier"""
+    """Total variational loss mutliplier"""
     overwrite_near_far_plane: bool = False
     """whether to use near and far collider from command line"""
-    
-    num_samples: int = 64
-    """Number of uniform samples"""
-    num_samples_importance: int = 64
-    """Number of importance samples"""
-    num_up_sample_steps: int = 4
-    """number of up sample step, 1 for simple coarse-to-fine sampling"""
-    base_variance: float = 64
-    """fixed base variance in NeuS sampler, the inv_s will be base * 2 ** iter during upsample"""
-    perturb: bool = True
-    """use to use perturb for the sampled points"""
+    scene_contraction_norm: Literal["inf", "l2"] = "inf"
+    """Which norm to use for the scene contraction."""
 
 
 class PermutoBaseModel(Model):
     """Base surface model
 
     Args:
-        config: Base surface model configuration to instantiate model
+        config: Base permutosdf model configuration to instantiate model
     """
 
     config: PermutoBaseModelConfig
@@ -126,7 +125,14 @@ class PermutoBaseModel(Model):
         """Set the fields and modules."""
         super().populate_modules()
 
-        self.scene_contraction = SceneContraction(order=float("inf"))
+        if self.config.scene_contraction_norm == "inf":
+            order = float("inf")
+        elif self.config.scene_contraction_norm == "l2":
+            order = None
+        else:
+            raise ValueError("Invalid scene contraction norm")
+
+        self.scene_contraction = SceneContraction(order=order)
 
         # Can we also use contraction for sdf?
         # Fields
@@ -149,17 +155,23 @@ class PermutoBaseModel(Model):
         self.anneal_end = 50000
 
         # Collider
-        self.collider = AABBBoxCollider(self.scene_box, near_plane=0.05)
-        # self.collider = SphereCollider(torch.Tensor([0, 0, 0]), 1.0)
+        if self.scene_box.collider_type == "near_far":
+            self.collider = NearFarCollider(near_plane=self.scene_box.near, far_plane=self.scene_box.far)
+        elif self.scene_box.collider_type == "box":
+            self.collider = AABBBoxCollider(self.scene_box, near_plane=self.scene_box.near)
+        elif self.scene_box.collider_type == "sphere":
+            # TODO do we also use near if the ray don't intersect with the sphere
+            self.collider = SphereCollider(radius=self.scene_box.radius, soft_intersection=True)
+        else:
+            raise NotImplementedError
 
         # command line near and far has highest priority
         if self.config.overwrite_near_far_plane:
             self.collider = NearFarCollider(near_plane=self.config.near_plane, far_plane=self.config.far_plane)
-            print('change to Nerf')
 
         # background model
         if self.config.background_model == "grid":
-            self.field_background = NerfactoField(
+            self.field_background = TCNNNerfactoField(
                 self.scene_box.aabb,
                 spatial_distortion=self.scene_contraction,
                 num_images=self.num_train_data,
@@ -204,22 +216,20 @@ class PermutoBaseModel(Model):
         self.psnr = PeakSignalNoiseRatio(data_range=1.0)
         self.ssim = structural_similarity_index_measure
         self.lpips = LearnedPerceptualImagePatchSimilarity()
-        
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = {}
         param_groups["fields"] = list(self.field.parameters())
-        param_groups["field_background"] = (
-            [self.field_background]
-            if isinstance(self.field_background, Parameter)
-            else list(self.field_background.parameters())
-        )
+        if self.config.background_model != "none":
+            param_groups["field_background"] = list(self.field_background.parameters())
+        else:
+            param_groups["field_background"] = list(self.field_background)
         return param_groups
     
     def get_training_callbacks(
         self, training_callback_attributes: TrainingCallbackAttributes
     ) -> List[TrainingCallback]:
-        callbacks = []
+        callbacks = super().get_training_callbacks(training_callback_attributes)
         # anneal for cos in NeuS
         if self.anneal_end > 0:
 
@@ -237,18 +247,7 @@ class PermutoBaseModel(Model):
 
         return callbacks
 
-    # @abstractmethod
-    # def sample_and_forward_field(self, ray_bundle: RayBundle) -> Dict[str, Any]:
-    #     """Takes in a Ray Bundle and returns a dictionary of samples and field output.
 
-    #     Args:
-    #         ray_bundle: Input bundle of rays. This raybundle should have all the
-    #         needed information to compute the outputs.
-
-    #     Returns:
-    #         Outputs of model. (ie. rendered colors)
-    #     """
-    
     def sample_and_forward_field(self, ray_bundle: RayBundle) -> Dict:
         ray_samples = self.sampler(ray_bundle, sdf_fn=self.field.get_sdf)
         field_outputs = self.field(ray_samples, return_alphas=True)
@@ -265,26 +264,47 @@ class PermutoBaseModel(Model):
         }
         return samples_and_field_outputs
 
-    def get_outputs(self, ray_bundle: RayBundle) -> Dict[str, torch.Tensor]:
-        """Takes in a Ray Bundle and returns a dictionary of outputs.
+    def get_foreground_mask(self, ray_samples: RaySamples) -> TensorType:
+        """_summary_
 
         Args:
-            ray_bundle: Input bundle of rays. This raybundle should have all the
-            needed information to compute the outputs.
-
-        Returns:
-            Outputs of model. (ie. rendered colors)
+            ray_samples (RaySamples): _description_
         """
-        assert (
-            ray_bundle.metadata is not None and "directions_norm" in ray_bundle.metadata
-        ), "directions_norm is required in ray_bundle.metadata"
+        # TODO support multiple foreground type: box and sphere
+        inside_sphere_mask = (ray_samples.frustums.get_start_positions().norm(dim=-1, keepdim=True) < 1.0).float()
+        return inside_sphere_mask
 
+    def forward_background_field_and_merge(self, ray_samples: RaySamples, field_outputs: Dict) -> Dict:
+        """_summary_
+
+        Args:
+            ray_samples (RaySamples): _description_
+            field_outputs (Dict): _description_
+        """
+
+        inside_sphere_mask = self.get_foreground_mask(ray_samples)
+        # TODO only forward the points that are outside the sphere if there is a background model
+
+        field_outputs_bg = self.field_background(ray_samples)
+        field_outputs_bg[FieldHeadNames.ALPHA] = ray_samples.get_alphas(field_outputs_bg[FieldHeadNames.DENSITY])
+
+        field_outputs[FieldHeadNames.ALPHA] = (
+            field_outputs[FieldHeadNames.ALPHA] * inside_sphere_mask
+            + (1.0 - inside_sphere_mask) * field_outputs_bg[FieldHeadNames.ALPHA]
+        )
+        field_outputs[FieldHeadNames.RGB] = (
+            field_outputs[FieldHeadNames.RGB] * inside_sphere_mask
+            + (1.0 - inside_sphere_mask) * field_outputs_bg[FieldHeadNames.RGB]
+        )
+
+        # TODO make everything outside the sphere to be 0
+        return field_outputs
+
+    def get_outputs(self, ray_bundle: RayBundle) -> Dict:
         samples_and_field_outputs = self.sample_and_forward_field(ray_bundle=ray_bundle)
 
-        # shortcuts
-        field_outputs: Dict[FieldHeadNames, torch.Tensor] = cast(
-            Dict[FieldHeadNames, torch.Tensor], samples_and_field_outputs["field_outputs"]
-        )
+        # Shotscuts
+        field_outputs = samples_and_field_outputs["field_outputs"]
         ray_samples = samples_and_field_outputs["ray_samples"]
         weights = samples_and_field_outputs["weights"]
         bg_transmittance = samples_and_field_outputs["bg_transmittance"]
@@ -292,13 +312,17 @@ class PermutoBaseModel(Model):
         rgb = self.renderer_rgb(rgb=field_outputs[FieldHeadNames.RGB], weights=weights)
         depth = self.renderer_depth(weights=weights, ray_samples=ray_samples)
         # the rendered depth is point-to-point distance and we should convert to depth
-        depth = depth / ray_bundle.metadata["directions_norm"]
+        depth = depth / ray_bundle.directions_norm
 
-        normal = self.renderer_normal(semantics=field_outputs[FieldHeadNames.NORMALS], weights=weights)
+        # remove the rays that don't intersect with the surface
+        # hit = (field_outputs[FieldHeadNames.SDF] > 0.0).any(dim=1) & (field_outputs[FieldHeadNames.SDF] < 0).any(dim=1)
+        # depth[~hit] = 10000.0
+
+        normal = self.renderer_normal(semantics=field_outputs[FieldHeadNames.NORMAL], weights=weights)
         accumulation = self.renderer_accumulation(weights=weights)
         
         curvature_loss = samples_and_field_outputs["curvature"]
-
+        
         # background model
         if self.config.background_model != "none":
             assert isinstance(self.field_background, torch.nn.Module), "field_background should be a module"
@@ -336,22 +360,31 @@ class PermutoBaseModel(Model):
             "depth": depth,
             "normal": normal,
             "weights": weights,
-            # used to scale z_vals for free space and sdf loss
-            "directions_norm": ray_bundle.metadata["directions_norm"],
+            "ray_points": self.scene_contraction(
+                ray_samples.frustums.get_start_positions()
+            ),  # used for creating visiblity mask
+            "directions_norm": ray_bundle.directions_norm,  # used to scale z_vals for free space and sdf loss
             
             "curvature_loss": curvature_loss,
-            
         }
+        
         outputs.update(bg_outputs)
 
         if self.training:
             grad_points = field_outputs[FieldHeadNames.GRADIENT]
-            outputs.update({"eik_grad": grad_points})
+            points_norm = field_outputs["points_norm"]
+            outputs.update({"eik_grad": grad_points, "points_norm": points_norm})
+
+            # TODO volsdf use different point set for eikonal loss
+            # grad_points = self.field.gradient(eik_points)
+            # outputs.update({"eik_grad": grad_points})
+
             outputs.update(samples_and_field_outputs)
 
+        # TODO how can we move it to neus_facto without out of memory
         if "weights_list" in samples_and_field_outputs:
-            weights_list = cast(List[torch.Tensor], samples_and_field_outputs["weights_list"])
-            ray_samples_list = cast(List[torch.Tensor], samples_and_field_outputs["ray_samples_list"])
+            weights_list = samples_and_field_outputs["weights_list"]
+            ray_samples_list = samples_and_field_outputs["ray_samples_list"]
 
             for i in range(len(weights_list) - 1):
                 outputs[f"prop_depth_{i}"] = self.renderer_depth(
@@ -360,29 +393,15 @@ class PermutoBaseModel(Model):
         # this is used only in viewer
         outputs["normal_vis"] = (outputs["normal"] + 1.0) / 2.0
         return outputs
-    
-    def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
-        """Computes and returns the losses dict.
 
-        Args:
-            outputs: the output to compute loss dict to
-            batch: ground truth batch corresponding to outputs
-            metrics_dict: dictionary of metrics, some of which we can use for loss
-        """
+    def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict:
         loss_dict = {}
         image = batch["image"].to(self.device)
         loss_dict["rgb_loss"] = self.rgb_loss(image, outputs["rgb"])
-        # print('########rgb_loss')
-        # print(loss_dict['rgb_loss'].shape)
-        # print(loss_dict['rgb_loss'])
         if self.training:
             # eikonal loss
             grad_theta = outputs["eik_grad"]
             loss_dict["eikonal_loss"] = ((grad_theta.norm(2, dim=-1) - 1) ** 2).mean() * self.config.eikonal_loss_mult
-
-            # print('########eikonal_loss')
-            # print(loss_dict['eikonal_loss'].shape)
-            # print(loss_dict['eikonal_loss'])
 
             # foreground mask loss
             if "fg_mask" in batch and self.config.fg_mask_loss_mult > 0.0:
@@ -412,7 +431,7 @@ class PermutoBaseModel(Model):
                 )
 
         return loss_dict
-
+    
     def get_metrics_dict(self, outputs, batch) -> Dict[str, torch.Tensor]:
         """Compute and returns metrics.
 
@@ -461,19 +480,13 @@ class PermutoBaseModel(Model):
     def get_image_metrics_and_images(
         self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
     ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
-        """Writes the test image outputs.
-        Args:
-            outputs: Outputs of the model.
-            batch: Batch of data.
-
-        Returns:
-            A dictionary of metrics.
-        """
         image = batch["image"].to(self.device)
         rgb = outputs["rgb"]
         acc = colormaps.apply_colormap(outputs["accumulation"])
 
         normal = outputs["normal"]
+        # don't need to normalize here
+        # normal = torch.nn.functional.normalize(normal, p=2, dim=-1)
         normal = (normal + 1.0) / 2.0
 
         combined_rgb = torch.cat([image, rgb], dim=1)
@@ -483,7 +496,7 @@ class PermutoBaseModel(Model):
             depth_pred = outputs["depth"]
 
             # align to predicted depth and normalize
-            scale, shift = normalized_depth_scale_and_shift(
+            scale, shift = compute_scale_and_shift(
                 depth_pred[None, ..., 0], depth_gt[None, ...], depth_gt[None, ...] > 0.0
             )
             depth_pred = depth_pred * scale + shift
@@ -509,6 +522,14 @@ class PermutoBaseModel(Model):
             "depth": combined_depth,
             "normal": combined_normal,
         }
+
+        if "sensor_depth" in batch:
+            sensor_depth = batch["sensor_depth"]
+            depth_pred = outputs["depth"]
+
+            combined_sensor_depth = torch.cat([sensor_depth[..., None], depth_pred], dim=1)
+            combined_sensor_depth = colormaps.apply_depth_colormap(combined_sensor_depth)
+            images_dict["sensor_depth"] = combined_sensor_depth
 
         # Switch images from [H, W, C] to [1, C, H, W] for metrics computations
         image = torch.moveaxis(image, -1, 0)[None, ...]

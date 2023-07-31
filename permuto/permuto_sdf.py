@@ -1,13 +1,15 @@
 """
 Implementation of permuto_sdf
+PermutoSDFModelConfig
+PermutoSDFModel
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Type, cast
-
+from typing import List, Type, Tuple, Dict
 import numpy as np
+
 import torch
 from torch.nn import Parameter
 
@@ -18,22 +20,18 @@ from nerfstudio.engine.callbacks import (
     TrainingCallbackLocation,
 )
 from nerfstudio.field_components.field_heads import FieldHeadNames
-from nerfstudio.fields.density_fields import HashMLPDensityField
-from nerfstudio.model_components.losses import interlevel_loss
-from nerfstudio.model_components.ray_samplers import (
-    ProposalNetworkSampler,
-    UniformSampler,
-)
 from nerfstudio.models.neus import NeuSModel, NeuSModelConfig
+from nerfstudio.fields.density_fields import HashMLPDensityField
+from nerfstudio.model_components.losses import interlevel_loss, interlevel_loss_zip
+from nerfstudio.model_components.ray_samplers import ProposalNetworkSampler
 from nerfstudio.utils import colormaps
 
 import math
-from permuto.permuto_base_model import PermutoBaseModel, PermutoBaseModelConfig
 
 
 @dataclass
-class PermutoSDFModelConfig(PermutoBaseModelConfig):
-    """NeusFacto Model Config"""
+class PermutoSDFModelConfig(NeuSModelConfig):
+    """UniSurf Model Config"""
 
     _target: Type = field(default_factory=lambda: PermutoSDFModel)
     num_proposal_samples_per_ray: Tuple[int, ...] = (256, 96)
@@ -65,13 +63,39 @@ class PermutoSDFModelConfig(PermutoBaseModelConfig):
     """Max num iterations for the annealing function."""
     use_single_jitter: bool = True
     """Whether use single jitter or not for the proposal networks."""
+    curvature_weight=0.65
+    """weight of the curvature loss"""
+    lipshitz_weight=3e-6
+    """weight of the lipshitz loss"""
+    
+    
+    use_anneal_beta: bool = False
+    """whether to anneal beta of neus or not similar to bakedsdf"""
+    beta_anneal_max_num_iters: int = 1000_000
+    """max num iterations for the annealing function of beta"""
+    beta_anneal_init: float = 0.05
+    """initial beta for annealing function"""
+    beta_anneal_end: float = 0.0002
+    """final beta for annealing function"""
+    # TODO move to base model config since it can be used in all models
+    enable_progressive_hash_encoding: bool = False
+    """whether to use progressive hash encoding"""
+    enable_numerical_gradients_schedule: bool = False
+    """whether to use numerical gradients delta schedule"""
+    enable_curvature_loss_schedule: bool = False
+    """whether to use curvature loss weight schedule"""
+    curvature_loss_multi: float = 0.0
+    """curvature loss weight"""
+    curvature_loss_warmup_steps: int = 20_000
+    """curvature loss warmup steps"""
+    level_init: int = 4
+    """initial level of multi-resolution hash encoding"""
+    steps_per_level: int = 10_000
+    """steps per level of multi-resolution hash encoding"""
 
 
-class PermutoSDFModel(PermutoBaseModel):
-    """NeuSFactoModel extends NeuSModel for a more efficient sampling strategy.
-
-    The model improves the rendering speed and quality by incorporating a learning-based
-    proposal distribution to guide the sampling process.(similar to mipnerf-360)
+class PermutoSDFModel(NeuSModel):
+    """NeuS facto model
 
     Args:
         config: NeuS configuration to instantiate model
@@ -80,7 +104,7 @@ class PermutoSDFModel(PermutoBaseModel):
     config: PermutoSDFModelConfig
 
     def populate_modules(self):
-        """Instantiate modules and fields, including proposal networks."""
+        """Set the fields and modules."""
         super().populate_modules()
 
         self.density_fns = []
@@ -107,21 +131,18 @@ class PermutoSDFModel(PermutoBaseModel):
             self.density_fns.extend([network.density_fn for network in self.proposal_networks])
 
         # update proposal network every iterations
-        def update_schedule(_):
-            return -1
+        update_schedule = lambda step: -1
 
-        initial_sampler = UniformSampler(single_jitter=self.config.use_single_jitter)
         self.proposal_sampler = ProposalNetworkSampler(
             num_nerf_samples_per_ray=self.config.num_neus_samples_per_ray,
             num_proposal_samples_per_ray=self.config.num_proposal_samples_per_ray,
             num_proposal_network_iterations=self.config.num_proposal_iterations,
+            use_uniform_sampler=False,
             single_jitter=self.config.use_single_jitter,
             update_sched=update_schedule,
-            initial_sampler=initial_sampler,
         )
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
-        """Return a dictionary with the parameters of the proposal networks."""
         param_groups = super().get_param_groups()
         param_groups["proposal_networks"] = list(self.proposal_networks.parameters())
         return param_groups
@@ -135,13 +156,10 @@ class PermutoSDFModel(PermutoBaseModel):
             # anneal the weights of the proposal network before doing PDF sampling
             N = self.config.proposal_weights_anneal_max_num_iters
 
-            def set_anneal(step: int):
+            def set_anneal(step):
                 # https://arxiv.org/pdf/2111.12077.pdf eq. 18
                 train_frac = np.clip(step / N, 0, 1)
-
-                def bias(x, b):
-                    return b * x / ((b - 1) * x + 1)
-
+                bias = lambda x, b: (b * x) / ((b - 1) * x + 1)
                 anneal = bias(train_frac, self.config.proposal_weights_anneal_slope)
                 self.proposal_sampler.set_anneal(anneal)
 
@@ -160,13 +178,112 @@ class PermutoSDFModel(PermutoBaseModel):
                 )
             )
 
+        if self.config.use_anneal_beta:
+            # anneal the beta of volsdf before each training iterations
+            M = self.config.beta_anneal_max_num_iters
+            beta_init = self.config.beta_anneal_init
+            beta_end = self.config.beta_anneal_end
+
+            def set_beta(step):
+                # bakedsdf's beta schedule adapted to neus
+                train_frac = np.clip(step / M, 0, 1)
+                beta = beta_init / (1 + (beta_init - beta_end) / beta_end * (train_frac**0.8))
+                beta = np.log(1.0 / beta) / 10.0
+                self.field.deviation_network.variance.data[...] = beta
+
+            callbacks.append(
+                TrainingCallback(
+                    where_to_run=[TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
+                    update_every_num_iters=1,
+                    func=set_beta,
+                )
+            )
+
+        # read the hash encoding parameters from field
+        level_init = self.config.level_init
+        # schedule the delta in numerical gradients computation
+        num_levels = self.field.num_levels
+        max_res = self.field.max_res
+        base_res = self.field.base_res
+        growth_factor = self.field.growth_factor
+
+        steps_per_level = self.config.steps_per_level
+
+        init_delta = 1.0 / base_res
+        end_delta = 1.0 / max_res
+
+        # compute the delta based on level
+        if self.config.enable_numerical_gradients_schedule:
+
+            def set_delta(step):
+                delta = 1.0 / (base_res * growth_factor ** (step / steps_per_level))
+                delta = max(1.0 / (4.0 * max_res), delta)
+                self.field.set_numerical_gradients_delta(
+                    delta * 4.0
+                )  # TODO because we divide 4 to normalize points to [0, 1]
+
+            callbacks.append(
+                TrainingCallback(
+                    where_to_run=[TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
+                    update_every_num_iters=1,
+                    func=set_delta,
+                )
+            )
+
+        # schedule the current level of multi-resolution hash encoding
+        if self.config.enable_progressive_hash_encoding:
+
+            def set_mask(step):
+                # TODO make this consistent with delta schedule
+                level = int(step / steps_per_level) + 1
+                level = max(level, level_init)
+                self.field.update_mask(level)
+
+            callbacks.append(
+                TrainingCallback(
+                    where_to_run=[TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
+                    update_every_num_iters=1,
+                    func=set_mask,
+                )
+            )
+        # schedule the curvature loss weight
+        # linear warmup for 5000 steps to 5e-4 and then decay as delta
+        self.curvature_loss_multi_factor = 1.0
+        if self.config.enable_curvature_loss_schedule:
+
+            def set_curvature_loss_mult_factor(step):
+                if step < self.config.curvature_loss_warmup_steps:
+                    factor = step / self.config.curvature_loss_warmup_steps
+                else:
+                    delta = 1.0 / (
+                        base_res * growth_factor ** ((step - self.config.curvature_loss_warmup_steps) / steps_per_level)
+                    )
+                    delta = max(1.0 / (max_res * 10.0), delta)
+                    factor = delta / init_delta
+
+                self.curvature_loss_multi_factor = factor
+
+            callbacks.append(
+                TrainingCallback(
+                    where_to_run=[TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
+                    update_every_num_iters=1,
+                    func=set_curvature_loss_mult_factor,
+                )
+            )
+
+        # TODO switch to analytic gradients after delta is small enough?
+
         return callbacks
 
-    def sample_and_forward_field(self, ray_bundle: RayBundle) -> Dict[str, Any]:
-        """Sample rays using proposal networks and compute the corresponding field outputs."""
+    def sample_and_forward_field(self, ray_bundle: RayBundle):
         ray_samples, weights_list, ray_samples_list = self.proposal_sampler(ray_bundle, density_fns=self.density_fns)
 
         field_outputs = self.field(ray_samples, return_alphas=True)
+
+        if self.config.background_model != "none":
+            field_outputs = self.forward_background_field_and_merge(ray_samples, field_outputs)
+
+        # weights = ray_samples.get_weights_from_alphas(field_outputs[FieldHeadNames.ALPHA])
         weights, transmittance = ray_samples.get_weights_and_transmittance_from_alphas(
             field_outputs[FieldHeadNames.ALPHA]
         )
@@ -174,9 +291,7 @@ class PermutoSDFModel(PermutoBaseModel):
 
         weights_list.append(weights)
         ray_samples_list.append(ray_samples)
-
-
-        # calculate the curvature loss according to the original code of permuto_sdf
+        
         inputs = ray_samples.frustums.get_start_positions()
         inputs = inputs.view(-1, 3)
         
@@ -210,145 +325,65 @@ class PermutoSDFModel(PermutoBaseModel):
         curvature=angle/math.pi    
         
         curvature_loss = curvature.mean()
-        
+
         samples_and_field_outputs = {
             "ray_samples": ray_samples,
             "field_outputs": field_outputs,
             "weights": weights,
-            "bg_transmittance": bg_transmittance,
             "weights_list": weights_list,
             "ray_samples_list": ray_samples_list,
+            "bg_transmittance": bg_transmittance,
             "curvature": curvature_loss,
         }
-        
         return samples_and_field_outputs
-    
-    def get_outputs(self, ray_bundle: RayBundle) -> Dict[str, torch.Tensor]:
-        """Takes in a Ray Bundle and returns a dictionary of outputs.
 
-        Args:
-            ray_bundle: Input bundle of rays. This raybundle should have all the
-            needed information to compute the outputs.
-
-        Returns:
-            Outputs of model. (ie. rendered colors)
-        """
-        assert (
-            ray_bundle.metadata is not None and "directions_norm" in ray_bundle.metadata
-        ), "directions_norm is required in ray_bundle.metadata"
-
-        samples_and_field_outputs = self.sample_and_forward_field(ray_bundle=ray_bundle)
-
-        # shortcuts
-        field_outputs: Dict[FieldHeadNames, torch.Tensor] = cast(
-            Dict[FieldHeadNames, torch.Tensor], samples_and_field_outputs["field_outputs"]
-        )
-        ray_samples = samples_and_field_outputs["ray_samples"]
-        weights = samples_and_field_outputs["weights"]
-        bg_transmittance = samples_and_field_outputs["bg_transmittance"]
-
-        rgb = self.renderer_rgb(rgb=field_outputs[FieldHeadNames.RGB], weights=weights)
-        depth = self.renderer_depth(weights=weights, ray_samples=ray_samples)
-        # the rendered depth is point-to-point distance and we should convert to depth
-        depth = depth / ray_bundle.metadata["directions_norm"]
-
-        normal = self.renderer_normal(semantics=field_outputs[FieldHeadNames.NORMALS], weights=weights)
-        accumulation = self.renderer_accumulation(weights=weights)
-        
-        curvature_loss = samples_and_field_outputs["curvature"]
-
-        # background model
-        if self.config.background_model != "none":
-            assert isinstance(self.field_background, torch.nn.Module), "field_background should be a module"
-            assert ray_bundle.fars is not None, "fars is required in ray_bundle"
-            # sample inversely from far to 1000 and points and forward the bg model
-            ray_bundle.nears = ray_bundle.fars
-            assert ray_bundle.fars is not None
-            ray_bundle.fars = torch.ones_like(ray_bundle.fars) * self.config.far_plane_bg
-
-            ray_samples_bg = self.sampler_bg(ray_bundle)
-            # use the same background model for both density field and occupancy field
-            assert not isinstance(self.field_background, Parameter)
-            field_outputs_bg = self.field_background(ray_samples_bg)
-            weights_bg = ray_samples_bg.get_weights(field_outputs_bg[FieldHeadNames.DENSITY])
-
-            rgb_bg = self.renderer_rgb(rgb=field_outputs_bg[FieldHeadNames.RGB], weights=weights_bg)
-            depth_bg = self.renderer_depth(weights=weights_bg, ray_samples=ray_samples_bg)
-            accumulation_bg = self.renderer_accumulation(weights=weights_bg)
-
-            # merge background color to foregound color
-            rgb = rgb + bg_transmittance * rgb_bg
-
-            bg_outputs = {
-                "bg_rgb": rgb_bg,
-                "bg_accumulation": accumulation_bg,
-                "bg_depth": depth_bg,
-                "bg_weights": weights_bg,
-            }
-        else:
-            bg_outputs = {}
-
-        outputs = {
-            "rgb": rgb,
-            "accumulation": accumulation,
-            "depth": depth,
-            "normal": normal,
-            "weights": weights,
-            # used to scale z_vals for free space and sdf loss
-            "directions_norm": ray_bundle.metadata["directions_norm"],
-            
-            "curvature_loss": curvature_loss,
-            
-        }
-        outputs.update(bg_outputs)
-
-        if self.training:
-            grad_points = field_outputs[FieldHeadNames.GRADIENT]
-            outputs.update({"eik_grad": grad_points})
-            outputs.update(samples_and_field_outputs)
-
-        if "weights_list" in samples_and_field_outputs:
-            weights_list = cast(List[torch.Tensor], samples_and_field_outputs["weights_list"])
-            ray_samples_list = cast(List[torch.Tensor], samples_and_field_outputs["ray_samples_list"])
-
-            for i in range(len(weights_list) - 1):
-                outputs[f"prop_depth_{i}"] = self.renderer_depth(
-                    weights=weights_list[i], ray_samples=ray_samples_list[i]
-                )
-        # this is used only in viewer
-        outputs["normal_vis"] = (outputs["normal"] + 1.0) / 2.0
-        return outputs
-
-    def get_loss_dict(
-        self, outputs: Dict[str, Any], batch: Dict[str, Any], metrics_dict: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        """Compute the loss dictionary, including interlevel loss for proposal networks."""
+    def get_loss_dict(self, outputs, batch, metrics_dict=None):
         loss_dict = super().get_loss_dict(outputs, batch, metrics_dict)
 
         if self.training:
-            loss_dict["interlevel_loss"] = self.config.interlevel_loss_mult * interlevel_loss(
+            loss_dict["interlevel_loss"] = self.config.interlevel_loss_mult * interlevel_loss_zip(
                 outputs["weights_list"], outputs["ray_samples_list"]
             )
+
+        # curvature loss
+        # if self.training and self.config.curvature_loss_multi > 0.0:
+        #     delta = self.field.numerical_gradients_delta
+        #     centered_sdf = outputs["field_outputs"][FieldHeadNames.SDF]
+        #     sourounding_sdf = outputs["field_outputs"]["sampled_sdf"]
+
+        #     sourounding_sdf = sourounding_sdf.reshape(centered_sdf.shape[:2] + (3, 2))
+
+        #     # (a - b)/d - (b -c)/d = (a + c - 2b)/d
+        #     # ((a - b)/d - (b -c)/d)/d = (a + c - 2b)/(d*d)
+        #     curvature = (sourounding_sdf.sum(dim=-1) - 2 * centered_sdf) / (delta * delta)
+        #     loss_dict["curvature_loss"] = (
+        #         torch.abs(curvature).mean() * self.config.curvature_loss_multi * self.curvature_loss_multi_factor
+            # )
             
             # curvature loss
-            loss_dict["curv_loss"] = outputs["curvature_loss"]*0.35
-            # print('########curv')
-            # print(loss_dict['curv_loss'].shape)
-            # print(loss_dict['curv_loss'])
+            loss_dict["curv_loss"] = outputs["curvature_loss"]*self.config.curvature_weight
             
-            
-            lipshitz_weight=3e-6
+            # lipshitz loss
+            # lipshitz_weight=3e-6
             loss_lipshitz = self.field.lipshitz_bound_full()
-            loss_dict["loss_lipshitz"] = loss_lipshitz.mean()*lipshitz_weight
-            # print('#####33 lipshitz')
-            # print(loss_dict["loss_lipshitz"])
+            loss_dict["loss_lipshitz"] = loss_lipshitz.mean()*self.config.lipshitz_weight
 
         return loss_dict
 
+    def get_metrics_dict(self, outputs, batch) -> Dict:
+        metrics_dict = super().get_metrics_dict(outputs, batch)
+
+        if self.training:
+            # training statics
+            metrics_dict["activated_encoding"] = self.field.hash_encoding_mask.mean().item()
+            metrics_dict["numerical_gradients_delta"] = self.field.numerical_gradients_delta
+            metrics_dict["curvature_loss_multi"] = self.curvature_loss_multi_factor * self.config.curvature_loss_multi
+
+        return metrics_dict
+
     def get_image_metrics_and_images(
-        self, outputs: Dict[str, Any], batch: Dict[str, Any]
+        self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
     ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
-        """Compute image metrics and images, including the proposal depth for each iteration."""
         metrics_dict, images_dict = super().get_image_metrics_and_images(outputs, batch)
         for i in range(self.config.num_proposal_iterations):
             key = f"prop_depth_{i}"
