@@ -26,7 +26,7 @@ from permuto.permuto_field import PermutoFieldConfig
 
 permuto_sdf_method = MethodSpecification(
     config=TrainerConfig(
-    method_name="neus-facto",
+    method_name="permutosdf",
     steps_per_eval_image=5000,
     steps_per_eval_batch=5000,
     steps_per_save=2000,
@@ -74,5 +74,6 @@ permuto_sdf_method = MethodSpecification(
     },
     viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
     vis="viewer",
-)
+    ),
+    description="sdf config for Permuto",
 )
