@@ -1,5 +1,5 @@
 [project]
-name = "permuto2nerfstudio"
+name = "permuto"
 version = "0.1.0"
 
 dependencies=[
@@ -10,4 +10,4 @@ dependencies=[
 include = ["permuto*"]
 
 [project.entry-points.'nerfstudio.method_configs']
-permutosdf = 'permuto2nerfstudio.permuto_config:permuto_sdf_method'
+permutosdf = 'permuto.permuto_config:permuto_sdf_method'
