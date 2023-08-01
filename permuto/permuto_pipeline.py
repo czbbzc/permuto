@@ -39,7 +39,7 @@ class PermutoPipelineConfig(VanillaPipelineConfig):
     """target class to instantiate"""
     datamanager: VanillaDataManagerConfig = VanillaDataManagerConfig()
     """specifies the datamanager config"""
-    model: ModelConfig = PermutoSDFModelConfig()
+    model: PermutoSDFModelConfig = PermutoSDFModelConfig()
     """specifies the model config"""
 
 
@@ -71,7 +71,7 @@ class PermutoPipeline(VanillaPipeline):
             scene_box=self.datamanager.train_dataset.scene_box,
             num_train_data=len(self.datamanager.train_dataset),
             metadata=self.datamanager.train_dataset.metadata,
-            image_encoder=self.image_encoder,
+            world_size=world_size,
             local_rank=local_rank,
         )
         self.model.to(device)

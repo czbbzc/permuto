@@ -28,9 +28,11 @@ from nerfstudio.utils import colormaps
 
 import math
 
+from permuto.permuto_base_model import PermutoBaseModelConfig, PermutoBaseModel
+
 
 @dataclass
-class PermutoSDFModelConfig(NeuSModelConfig):
+class PermutoSDFModelConfig(PermutoBaseModelConfig):
     """UniSurf Model Config"""
 
     _target: Type = field(default_factory=lambda: PermutoSDFModel)
@@ -94,7 +96,7 @@ class PermutoSDFModelConfig(NeuSModelConfig):
     """steps per level of multi-resolution hash encoding"""
 
 
-class PermutoSDFModel(NeuSModel):
+class PermutoSDFModel(PermutoBaseModel):
     """NeuS facto model
 
     Args:
@@ -295,7 +297,7 @@ class PermutoSDFModel(NeuSModel):
         inputs = ray_samples.frustums.get_start_positions()
         inputs = inputs.view(-1, 3)
         
-        normals = field_outputs[FieldHeadNames.NORMALS]
+        normals = field_outputs[FieldHeadNames.NORMAL]
         
         epsilon = 1e-4
         rand_directions = torch.rand_like(normals)

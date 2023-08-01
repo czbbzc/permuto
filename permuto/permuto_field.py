@@ -266,6 +266,12 @@ class PermutoField(Field):
         #     self.encoding = TensorVMEncoding(128, 24, smoothstep=smoothstep)
             
         # create encoding
+        
+        self.hash_encoding_mask = torch.ones(
+            self.num_levels * self.features_per_level+4,
+            dtype=torch.float32,
+        )
+        
         pos_dim=3
         capacity=pow(2,18) #2pow18
         nr_levels=self.num_levels

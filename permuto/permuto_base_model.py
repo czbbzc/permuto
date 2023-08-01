@@ -110,6 +110,18 @@ class PermutoBaseModelConfig(ModelConfig):
     """whether to use near and far collider from command line"""
     scene_contraction_norm: Literal["inf", "l2"] = "inf"
     """Which norm to use for the scene contraction."""
+    
+    num_samples: int = 64
+    """Number of uniform samples"""
+    num_samples_importance: int = 64
+    """Number of importance samples"""
+    num_up_sample_steps: int = 4
+    """number of up sample step, 1 for simple coarse-to-fine sampling"""
+    base_variance: float = 64
+    """fixed base variance in NeuS sampler, the inv_s will be base * 2 ** iter during upsample"""
+    perturb: bool = True
+    """use to use perturb for the sampled points"""
+
 
 
 class PermutoBaseModel(Model):
