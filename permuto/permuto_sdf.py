@@ -65,10 +65,14 @@ class PermutoSDFModelConfig(PermutoBaseModelConfig):
     """Max num iterations for the annealing function."""
     use_single_jitter: bool = True
     """Whether use single jitter or not for the proposal networks."""
-    curvature_weight=0.65
+    curvature_weight=0.55
     """weight of the curvature loss"""
     lipshitz_weight=3e-6
     """weight of the lipshitz loss"""
+    start_reduce_curv=9500
+    """start to reduce the weight of the curvature loss, and add the lipshitz loss"""
+    finish_reduce_curv=10501
+    """finish reducing the weight of the curvature loss"""
     
     
     use_anneal_beta: bool = False

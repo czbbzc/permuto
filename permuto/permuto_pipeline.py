@@ -106,16 +106,22 @@ class PermutoPipeline(VanillaPipeline):
 
         loss_dict = self.model.get_loss_dict(model_outputs, batch, metrics_dict)
         
-        global_weight_curvature=map_range_val(step, 5000, 6001, 1.0, 0.000)
+        # 9500 10501
+        global_weight_curvature=map_range_val(step, self.model.config.start_reduce_curv, self.model.config.finish_reduce_curv, 1.0, 0.000)
         if global_weight_curvature > 0.0:
             loss_dict["curv_loss"] = loss_dict["curv_loss"] * global_weight_curvature
         else:
             del loss_dict["curv_loss"]
         
-        if step < 5000:
+        if step < self.model.config.start_reduce_curv:
             del loss_dict["loss_lipshitz"]
+            
+        # if (step == self.model.config.start_reduce_curv-1) or (step == self.model.config.start_reduce_curv) or (step == self.model.config.start_reduce_curv+1):
+        #     print(step)
+        #     print(global_weight_curvature)
+        #     print(loss_dict)
+            
         
-        curvature_weight=0.65
-        lipshitz_weight=3e-6
+        
 
         return model_outputs, loss_dict, metrics_dict
