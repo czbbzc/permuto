@@ -355,7 +355,7 @@ class PermutoField(Field):
             self.specular_tint_pred = nn.Linear(self.config.geo_feat_dim, 3)
 
         # view dependent color network
-        dims = [self.config.hidden_dim_color for _ in range(self.config.num_layers_color)]
+        dims = [self.config.hidden_dim_color for _ in range(self.config.num_layers_color)]  # [256, 256]
         if self.config.use_diffuse_color:
             in_dim = (
                 self.direction_encoding.get_out_dim()
