@@ -116,10 +116,13 @@ class PermutoPipeline(VanillaPipeline):
         if step < self.model.config.start_reduce_curv:
             del loss_dict["loss_lipshitz"]
             
-        # if (step == self.model.config.start_reduce_curv-1) or (step == self.model.config.start_reduce_curv) or (step == self.model.config.start_reduce_curv+1):
-        #     print(step)
-        #     print(global_weight_curvature)
-        #     print(loss_dict)
+        if (step == self.model.config.start_reduce_curv-1) or (step == self.model.config.start_reduce_curv) or (step == self.model.config.start_reduce_curv+1):
+            print(step)
+            print(global_weight_curvature)
+            print(loss_dict)
+            print(self.model.config.start_reduce_curv)
+            print(self.model.config.finish_reduce_curv)
+            print(self.model)
             
         
         

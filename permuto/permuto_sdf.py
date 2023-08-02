@@ -69,9 +69,9 @@ class PermutoSDFModelConfig(PermutoBaseModelConfig):
     """weight of the curvature loss"""
     lipshitz_weight=3e-6
     """weight of the lipshitz loss"""
-    start_reduce_curv=9500
+    start_reduce_curv=5000
     """start to reduce the weight of the curvature loss, and add the lipshitz loss"""
-    finish_reduce_curv=10501
+    finish_reduce_curv=6001
     """finish reducing the weight of the curvature loss"""
     
     
