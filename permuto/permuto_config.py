@@ -118,7 +118,7 @@ method_configs["permutosdf"] = Config(
     trainer=TrainerConfig(
         steps_per_eval_image=5000,
         steps_per_eval_batch=5000,
-        steps_per_save=2000,
+        steps_per_save=20000,
         steps_per_eval_all_images=1000000,  # set to a very large model so we don't eval with all images
         max_num_iterations=20001,
         mixed_precision=False,
@@ -129,7 +129,7 @@ method_configs["permutosdf"] = Config(
             train_num_rays_per_batch=2048,
             eval_num_rays_per_batch=2048,
             camera_optimizer=CameraOptimizerConfig(
-                mode="SO3xR3", optimizer=AdamOptimizerConfig(lr=6e-4, eps=1e-8, weight_decay=1e-2)
+                mode="off", optimizer=AdamOptimizerConfig(lr=6e-4, eps=1e-8, weight_decay=1e-2)
             ),
         ),
                 
