@@ -22,6 +22,7 @@ from nerfstudio.engine.schedulers import (
 
 from permuto.permuto_sdf import PermutoSDFModelConfig
 from permuto.permuto_field import PermutoFieldConfig
+from permuto.permuto_pipeline import PermutoPipelineConfig
 
 
 permuto_sdf_method = MethodSpecification(
@@ -29,11 +30,11 @@ permuto_sdf_method = MethodSpecification(
     method_name="permutosdf",
     steps_per_eval_image=5000,
     steps_per_eval_batch=5000,
-    steps_per_save=2000,
+    steps_per_save=20000,
     steps_per_eval_all_images=1000000,  # set to a very large model so we don't eval with all images
     max_num_iterations=20001,
     mixed_precision=False,
-    pipeline=VanillaPipelineConfig(
+    pipeline=PermutoPipelineConfig(
         datamanager=VanillaDataManagerConfig(
             _target=VanillaDataManager[SDFDataset],
             dataparser=SDFStudioDataParserConfig(),

@@ -65,6 +65,15 @@ class PermutoSDFModelConfig(PermutoBaseModelConfig):
     """Max num iterations for the annealing function."""
     use_single_jitter: bool = True
     """Whether use single jitter or not for the proposal networks."""
+    
+    curvature_weight=0.55
+    """weight of the curvature loss"""
+    lipshitz_weight=1.5e-6
+    """weight of the lipshitz loss"""
+    start_reduce_curv=5000
+    """start to reduce the weight of the curvature loss, and add the lipshitz loss"""
+    finish_reduce_curv=6001
+    """finish reducing the weight of the curvature loss"""
 
 
 class PermutoSDFModel(PermutoBaseModel):
@@ -331,15 +340,13 @@ class PermutoSDFModel(PermutoBaseModel):
             )
             
             # curvature loss
-            loss_dict["curv_loss"] = outputs["curvature_loss"]*0.35
+            loss_dict["curv_loss"] = outputs["curvature_loss"]*self.config.curvature_weight
             # print('########curv')
             # print(loss_dict['curv_loss'].shape)
             # print(loss_dict['curv_loss'])
             
-            
-            lipshitz_weight=3e-6
             loss_lipshitz = self.field.lipshitz_bound_full()
-            loss_dict["loss_lipshitz"] = loss_lipshitz.mean()*lipshitz_weight
+            loss_dict["loss_lipshitz"] = loss_lipshitz.mean()*self.config.lipshitz_weight
             # print('#####33 lipshitz')
             # print(loss_dict["loss_lipshitz"])
 
