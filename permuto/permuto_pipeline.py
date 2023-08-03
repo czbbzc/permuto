@@ -15,8 +15,7 @@ from nerfstudio.pipelines.base_pipeline import (
 
 from nerfstudio.data.datamanagers.base_datamanager import (
     DataManager,
-    FlexibleDataManager,
-    FlexibleDataManagerConfig,
+    DataManagerConfig,
     VanillaDataManager,
     VanillaDataManagerConfig,
 )
@@ -51,6 +50,7 @@ class PermutoPipeline(VanillaPipeline):
         test_mode: Literal["test", "val", "inference"] = "val",
         world_size: int = 1,
         local_rank: int = 0,
+        grad_scaler: Optional[GradScaler] = None,
     ):
         super(VanillaPipeline, self).__init__()
         self.config = config
