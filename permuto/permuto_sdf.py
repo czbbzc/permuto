@@ -66,9 +66,9 @@ class PermutoSDFModelConfig(PermutoBaseModelConfig):
     use_single_jitter: bool = True
     """Whether use single jitter or not for the proposal networks."""
     
-    curvature_weight=0.55
+    curvature_weight=0.65
     """weight of the curvature loss"""
-    lipshitz_weight=1.5e-6
+    lipshitz_weight=3e-6
     """weight of the lipshitz loss"""
     start_reduce_curv=5000
     """start to reduce the weight of the curvature loss, and add the lipshitz loss"""
